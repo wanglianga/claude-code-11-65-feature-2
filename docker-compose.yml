@@ -1,0 +1,35 @@
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: agri_pit
+      POSTGRES_USER: ccdev
+      POSTGRES_PASSWORD: ccdev
+    ports:
+      - "5432:5432"
+    volumes:
+      - agri_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ccdev -d agri_pit"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_URL: jdbc:postgresql://db:5432/agri_pit
+      DB_USER: ccdev
+      DB_PASSWORD: ccdev
+      APP_SEED_DEMO: "true"
+      SERVER_PORT: "8080"
+    ports:
+      - "8080:8080"
+
+volumes:
+  agri_pgdata:

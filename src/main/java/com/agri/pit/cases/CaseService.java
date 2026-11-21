@@ -3,8 +3,11 @@ package com.agri.pit.cases;
 import com.agri.pit.common.ApiException;
 import com.agri.pit.common.Db;
 import com.agri.pit.common.Times;
+import com.agri.pit.boundary.GeometryFreezeService;
 import com.agri.pit.catalog.CatalogService;
 import com.agri.pit.catalog.CatalogService.ApprovedFeature;
+import com.agri.pit.tenure.TenureVersionService;
+import com.agri.pit.tenure.TenureVersionService.TenureRow;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -18,10 +21,15 @@ public class CaseService {
 
     private final Db db;
     private final CatalogService catalog;
+    private final GeometryFreezeService freezer;
+    private final TenureVersionService tenure;
 
-    public CaseService(Db db, CatalogService catalog) {
+    public CaseService(Db db, CatalogService catalog, GeometryFreezeService freezer,
+                       TenureVersionService tenure) {
         this.db = db;
         this.catalog = catalog;
+        this.freezer = freezer;
+        this.tenure = tenure;
     }
 
     @Transactional
@@ -40,8 +48,7 @@ public class CaseService {
         ParcelRow parcel = resolveParcel(req);
         long boundaryVersionId = req.boundaryVersionId() != null
                 ? requireBoundaryVersionForParcel(req.boundaryVersionId(), parcel.id())
-                : selectBoundaryVersionAt(parcel.id(), req.scoringCutoff());
-        List<ApprovedFeature> features = catalog.approvedFeatures();
+                : selectBoundaryVersionAt(parcel.id(), req.scoringCutoff());        List<ApprovedFeature> features = catalog.approvedFeatures();
         if (features.isEmpty()) {
             throw ApiException.unprocessable("NO_APPROVED_FEATURES",
                     "no approved feature definitions exist; approve the catalog before opening a case");
@@ -63,6 +70,10 @@ public class CaseService {
                             values (?, ?)
                             """, caseId, feature.versionId());
         }
+        // Freeze the exact geometry version this case may ever be scored on. Later re-surveys and
+        // tenure approvals are invisible to this case; they can only trigger a separate review.
+        freezer.freezeForCase(new GeometryFreezeService.CaseRef(caseId, req.caseNo().trim(),
+                parcel.id(), boundaryVersionId, req.scoringCutoff()), null, req.note());
         db.jdbc().update("update claim_case set status = 'QUEUED' where id = ?", caseId);
         enqueueOriginalRun(caseId, req.scoringCutoff(), req.hazardDate(), boundaryVersionId,
                 "case intake");
@@ -103,6 +114,13 @@ public class CaseService {
     }
 
     private long selectBoundaryVersionAt(long parcelId, Instant cutoff) {
+        // Preferred baseline: the geometry referenced by the tenure version that was already
+        // APPROVED and visible at intake. This is the platform's governance choice — scoring uses
+        // the geometry approved when the case was accepted, never the newest registry map.
+        TenureRow approved = tenure.approvedTenureAsOf(parcelId, cutoff);
+        if (approved != null) {
+            return approved.boundaryVersionId();
+        }
         List<Long> ids = db.jdbc().query("""
                         select id from parcel_boundary_version
                          where parcel_id = ? and ingested_at <= ?

@@ -1,5 +1,6 @@
 package com.agri.pit.runs;
 
+import com.agri.pit.boundary.GeometryFreezeService;
 import com.agri.pit.cases.CaseService;
 import com.agri.pit.cases.CaseService.CaseRow;
 import com.agri.pit.catalog.CatalogService;
@@ -47,9 +48,11 @@ public class RunExecutor {
     private final LeakageDetector detector;
     private final SnapshotService snapshots;
     private final RunService runService;
+    private final GeometryFreezeService freezer;
 
     public RunExecutor(Db db, CaseService cases, CatalogService catalog, AsOfSelector selector,
-                       LeakageDetector detector, SnapshotService snapshots, RunService runService) {
+                       LeakageDetector detector, SnapshotService snapshots, RunService runService,
+                       GeometryFreezeService freezer) {
         this.db = db;
         this.cases = cases;
         this.catalog = catalog;
@@ -57,6 +60,7 @@ public class RunExecutor {
         this.detector = detector;
         this.snapshots = snapshots;
         this.runService = runService;
+        this.freezer = freezer;
     }
 
     public record ClaimResult(long runId, String status, String verdict, Long snapshotId) {
@@ -90,6 +94,13 @@ public class RunExecutor {
                 ? run.boundaryVersionId() : caseRow.boundaryVersionId();
         BoundaryRow boundary = loadBoundary(boundaryVersionId);
         Geometry geometry = selector.parseGeometry(boundary.geometry());
+        // The intake freeze is the authoritative geometry: even if a tenure approval or warehouse
+        // backfill runs concurrently, scoring reads the polygon snapshot locked when the case was
+        // accepted. Boundary-variant runs deliberately use another version and keep the registry read.
+        var freeze = freezer.findByCaseId(caseRow.id());
+        if (freeze != null && freeze.boundaryVersionId() == boundaryVersionId) {
+            geometry = selector.parseGeometry(freeze.geometrySnapshot());
+        }
         RunMode mode = RunMode.valueOf(run.mode());
         Instant ceiling = run.availabilityCeiling();
 

@@ -21,13 +21,14 @@ public class OpenApiConfig {
                         .version("1.0.0")
                         .description("""
                                 Feature catalog, point-in-time warehouse, backfill orchestrator, leakage detector,
-                                scoring snapshots, and revision impact analysis for drought claim verification.
+                                scoring snapshots, revision impact analysis, tenure versioning, case geometry
+                                freezing, boundary overlap analysis, pixel allocation/arbitration and the dispute desk.
 
                                 **Two clocks.** Every warehouse record stores `observedAt` (when the phenomenon happened)
                                 and `ingestedAt` (when the platform could actually see it). Features are always selected
                                 with `ingestedAt <= availabilityCeiling`, never by observation time alone.
 
-                                **Three guarantees.**
+                                **Guarantees.**
                                 1. A scene acquired before the hazard but ingested after the scoring cutoff is excluded
                                    from the original run and recorded as a leakage exclusion.
                                 2. When two parcel boundary versions cover the same ground, each raster cell belongs to
@@ -35,6 +36,11 @@ public class OpenApiConfig {
                                    shared pixels excluded instead of double counting them.
                                 3. A weather revision that arrives after settlement only creates a pending review
                                    candidate. The frozen snapshot and the settled payout are never rewritten.
+                                4. A case is scored only on the parcel geometry APPROVED and visible at intake; the
+                                   geometry freeze is immutable, so later transfers/re-surveys cannot silently move a
+                                   historical case's area. Cross-parcel overlaps beyond the policy tolerance queue their
+                                   pixels for arbitration, and dispute reviews always create a fresh sampling run while
+                                   retaining every prior ruling and the original area result.
                                 """)
                         .contact(new Contact().name("Claims platform"))
                         .license(new License().name("Proprietary")))

@@ -149,4 +149,75 @@ public class GeoUtil {
         coords.add(lat);
         return node;
     }
+
+    /**
+     * Serialize a JTS geometry back to GeoJSON. Only polygonal parts are emitted: overlap
+     * intersections may carry degenerate line / point pieces, which carry no area and are dropped.
+     * Returns null when the geometry has no polygonal component.
+     */
+    public ObjectNode toGeoJson(Geometry geometry) {
+        ObjectMapper mapper = new ObjectMapper();
+        if (geometry instanceof Polygon polygon) {
+            return polygonNode(mapper, polygon);
+        }
+        if (geometry instanceof org.locationtech.jts.geom.MultiPolygon multi) {
+            ObjectNode node = mapper.createObjectNode();
+            node.put("type", "MultiPolygon");
+            ArrayNode coords = node.putArray("coordinates");
+            for (int i = 0; i < multi.getNumGeometries(); i++) {
+                coords.add(polygonCoordinates(mapper, (Polygon) multi.getGeometryN(i)));
+            }
+            return node;
+        }
+        List<Polygon> polygons = new ArrayList<>();
+        for (int i = 0; i < geometry.getNumGeometries(); i++) {
+            Geometry part = geometry.getGeometryN(i);
+            if (part instanceof Polygon polygon && polygon.getArea() > 0) {
+                polygons.add(polygon);
+            }
+        }
+        if (polygons.isEmpty()) {
+            return null;
+        }
+        if (polygons.size() == 1) {
+            return polygonNode(mapper, polygons.get(0));
+        }
+        ObjectNode node = mapper.createObjectNode();
+        node.put("type", "MultiPolygon");
+        ArrayNode coords = node.putArray("coordinates");
+        for (Polygon polygon : polygons) {
+            coords.add(polygonCoordinates(mapper, polygon));
+        }
+        return node;
+    }
+
+    private ObjectNode polygonNode(ObjectMapper mapper, Polygon polygon) {
+        ObjectNode node = mapper.createObjectNode();
+        node.put("type", "Polygon");
+        node.set("coordinates", polygonCoordinates(mapper, polygon));
+        return node;
+    }
+
+    private ArrayNode polygonCoordinates(ObjectMapper mapper, Polygon polygon) {
+        ArrayNode rings = mapper.createArrayNode();
+        rings.add(ringCoordinates(mapper, polygon.getExteriorRing().getCoordinates()));
+        for (int h = 0; h < polygon.getNumInteriorRing(); h++) {
+            rings.add(ringCoordinates(mapper, polygon.getInteriorRingN(h).getCoordinates()));
+        }
+        return rings;
+    }
+
+    private ArrayNode ringCoordinates(ObjectMapper mapper, Coordinate[] coordinates) {
+        ArrayNode ring = mapper.createArrayNode();
+        for (Coordinate coordinate : coordinates) {
+            ArrayNode point = ring.addArray();
+            point.add(round6(coordinate.x));
+            point.add(round6(coordinate.y));
+        }
+        return ring;
+    }
+
+    private static double round6(double value) {
+        return Math.round(value * 1_000_000d) / 1_000_000d;
+    }
 }

@@ -3,6 +3,7 @@ package com.agri.pit.leakage;
 import com.agri.pit.common.Db;
 import com.agri.pit.common.GeoUtil;
 import com.agri.pit.common.Times;
+import com.agri.pit.dispute.PixelAllocatorService;
 import com.agri.pit.model.InputVerdict;
 import com.agri.pit.model.SourceType;
 import org.locationtech.jts.geom.Geometry;
@@ -34,10 +35,12 @@ public class AsOfSelector {
 
     private final Db db;
     private final GeoUtil geo;
+    private final PixelAllocatorService allocator;
 
-    public AsOfSelector(Db db, GeoUtil geo) {
+    public AsOfSelector(Db db, GeoUtil geo, PixelAllocatorService allocator) {
         this.db = db;
         this.geo = geo;
+        this.allocator = allocator;
     }
 
     public record Window(Instant start, Instant end) {
@@ -92,6 +95,10 @@ public class AsOfSelector {
         }
 
         List<SceneCellMatch> matches = new ArrayList<>();
+        PixelAllocatorService.AllocationContext allocationContext = allocator.newContext(
+                runId, caseId, parcelId, boundaryVersionId, ceiling);
+        List<PixelAllocatorService.BoundaryCandidate> allBoundaries =
+                allocator.candidateBoundaries(ceiling);
         for (SceneRow scene : scenes) {
             List<CellRow> cells = db.jdbc().query("""
                             select id, cell_key, lon, lat, ndvi from satellite_scene_cell
@@ -103,31 +110,58 @@ public class AsOfSelector {
                     scene.id());
             boolean anyInParcel = false;
             int allocatedElsewhere = 0;
+            int pendingArbitration = 0;
             for (CellRow cell : cells) {
                 if (!geo.contains(geometry, cell.lon(), cell.lat())) {
                     continue;
                 }
                 anyInParcel = true;
-                PixelOwner owner = resolveOwner(scene.id(), cell.id(), cell.lon(), cell.lat(),
-                        cell.ndvi(), ceiling, runId, caseId, parcelId, boundaryVersionId);
-                if (!owner.ownedByCurrentRun()) {
-                    allocatedElsewhere++;
+                List<PixelAllocatorService.BoundaryCandidate> containing = new ArrayList<>();
+                for (PixelAllocatorService.BoundaryCandidate candidate : allBoundaries) {
+                    if (geo.contains(candidate.geometry(), cell.lon(), cell.lat())) {
+                        containing.add(candidate);
+                    }
+                }
+                if (containing.stream().noneMatch(c -> c.boundaryVersionId() == boundaryVersionId)) {
+                    // The run boundary is parsed from the same registry data, so this is defensive.
+                    continue;
+                }
+                PixelAllocatorService.Decision decision = allocator.decide(allocationContext, containing,
+                        scene.id(), cell.id(), cell.ndvi());
+                if (decision.usableByCurrentRun()) {
+                    matches.add(new SceneCellMatch(scene.id(), cell.id(), scene.sceneKey(), scene.revisionNo(),
+                            scene.acquisitionAt(), scene.ingestedAt(), cell.lon(), cell.lat(), cell.ndvi()));
+                    continue;
+                }
+                if ("PENDING_ARBITRATION".equals(decision.allocationStatus())) {
+                    pendingArbitration++;
                     ledger.add(record(SourceType.SATELLITE_NDVI, "satellite_scene_cell", cell.id(),
                             scene.revisionNo(), scene.sceneKey() + "/" + cell.key(),
                             scene.acquisitionAt(), scene.ingestedAt(),
-                            InputVerdict.EXCLUDED_PIXEL_ALLOCATED_OTHER_PARCEL,
-                            "cell is granted to parcel " + owner.parcelId() + " boundary v"
-                                    + owner.boundaryVersionNo() + " to avoid double counting the same pixel"));
+                            InputVerdict.EXCLUDED_PENDING_ARBITRATION,
+                            decision.reason() + (decision.disputeId() == null ? ""
+                                    : " (dispute " + decision.disputeId() + ")")));
                     continue;
                 }
-                matches.add(new SceneCellMatch(scene.id(), cell.id(), scene.sceneKey(), scene.revisionNo(),
-                        scene.acquisitionAt(), scene.ingestedAt(), cell.lon(), cell.lat(), cell.ndvi()));
+                allocatedElsewhere++;
+                ledger.add(record(SourceType.SATELLITE_NDVI, "satellite_scene_cell", cell.id(),
+                        scene.revisionNo(), scene.sceneKey() + "/" + cell.key(),
+                        scene.acquisitionAt(), scene.ingestedAt(),
+                        InputVerdict.EXCLUDED_PIXEL_ALLOCATED_OTHER_PARCEL,
+                        decision.reason()));
             }
             if (anyInParcel && allocatedElsewhere > 0) {
                 ledger.violation(new InputLedger.Violation("PIXEL_SHARED_BETWEEN_FIELDS", "WARNING",
                         SourceType.SATELLITE_NDVI, scene.id(), null,
                         allocatedElsewhere + " cell(s) of scene " + scene.sceneKey()
                                 + " overlap another parcel/version and were excluded to keep fields isolated"));
+            }
+            if (pendingArbitration > 0) {
+                ledger.violation(new InputLedger.Violation("PIXEL_PENDING_ARBITRATION", "WARNING",
+                        SourceType.SATELLITE_NDVI, scene.id(), null,
+                        pendingArbitration + " cell(s) of scene " + scene.sceneKey()
+                                + " fall in an overlap beyond the policy tolerance; they are queued for "
+                                + "manual arbitration and attributed to neither claim"));
             }
             if (cells.isEmpty()) {
                 ledger.violation(new InputLedger.Violation("SCENE_WITHOUT_CELLS", "INFO",
@@ -158,81 +192,6 @@ public class AsOfSelector {
                     "no scene was both acquired inside the window and available at the ceiling"));
         }
         return new ScenePick(matches, !scenes.isEmpty());
-    }
-
-    // ------------------------------------------------------------ pixel owners
-
-    public record PixelOwner(boolean ownedByCurrentRun, long parcelId, int boundaryVersionNo) {
-    }
-
-    private record BoundaryCandidate(long boundaryVersionId, long parcelId, int versionNo, Long lockedCaseId) {
-    }
-
-    /**
-     * Resolve the single owner of a raster cell among boundary versions that contain it.
-     * Priority: a boundary locked by an existing claim case wins (earliest case id first),
-     * otherwise the lowest parcel id, then the lowest boundary version id. The decision depends
-     * only on stored data, never on which run happens to execute first, so replays reproduce it.
-     */
-    private PixelOwner resolveOwner(long sceneId, long cellId, double lon, double lat, double ndvi,
-                                    Instant ceiling, long runId, Long caseId, long parcelId,
-                                    long boundaryVersionId) {
-        List<BoundaryCandidate> candidates = new ArrayList<>();
-        db.jdbc().query("""
-                        select b.id, b.parcel_id, b.version_no, b.geometry_geojson,
-                               (select min(c.id) from claim_case c where c.boundary_version_id = b.id) as case_id
-                          from parcel_boundary_version b
-                         where b.ingested_at <= ?
-                            or exists (select 1 from claim_case c where c.boundary_version_id = b.id)
-                         order by b.id
-                        """, rs -> {
-            Geometry geometry = geo.parse(db.readTree(rs.getString("geometry_geojson")));
-            if (geo.contains(geometry, lon, lat)) {
-                candidates.add(new BoundaryCandidate(rs.getLong("id"), rs.getLong("parcel_id"),
-                        rs.getInt("version_no"), (Long) rs.getObject("case_id")));
-            }
-        }, Db.timestamp(ceiling));
-        BoundaryCandidate owner = null;
-        for (BoundaryCandidate candidate : candidates) {
-            if (owner == null || better(candidate, owner)) {
-                owner = candidate;
-            }
-        }
-        if (owner == null) {
-            // No boundary registry entry; the run's own locked version is the only owner.
-            return new PixelOwner(true, parcelId, 0);
-        }
-        boolean current = owner.boundaryVersionId() == boundaryVersionId;
-        upsertPixelClaim(sceneId, cellId, current ? runId : null, caseId, owner.parcelId(),
-                owner.boundaryVersionId(), ndvi);
-        return new PixelOwner(current, owner.parcelId(), owner.versionNo());
-    }
-
-    private static boolean better(BoundaryCandidate candidate, BoundaryCandidate current) {
-        boolean candLocked = candidate.lockedCaseId() != null;
-        boolean currLocked = current.lockedCaseId() != null;
-        if (candLocked != currLocked) {
-            return candLocked;
-        }
-        if (candLocked) {
-            return candidate.lockedCaseId() < current.lockedCaseId();
-        }
-        if (candidate.parcelId() != current.parcelId()) {
-            return candidate.parcelId() < current.parcelId();
-        }
-        return candidate.boundaryVersionId() < current.boundaryVersionId();
-    }
-
-    private void upsertPixelClaim(long sceneId, long cellId, Long runId, Long caseId, long parcelId,
-                                  long boundaryVersionId, double ndvi) {
-        db.jdbc().update("""
-                        insert into pixel_claim (scene_id, cell_id, run_id, case_id, parcel_id,
-                                                 boundary_version_id, ndvi)
-                        values (?, ?, ?, ?, ?, ?, ?)
-                        on conflict (scene_id, cell_id)
-                        do update set run_id = coalesce(excluded.run_id, pixel_claim.run_id),
-                                      ndvi = excluded.ndvi
-                        """, sceneId, cellId, runId, caseId, parcelId, boundaryVersionId, ndvi);
     }
 
     // ----------------------------------------------------------------- weather

@@ -13,6 +13,8 @@ public enum InputVerdict {
     EXCLUDED_NO_SAMPLES_IN_PARCEL,
     /** Samples were partly or wholly allocated to another parcel to avoid pixel double counting. */
     EXCLUDED_PIXEL_ALLOCATED_OTHER_PARCEL,
+    /** Samples sit inside an overlap zone over the policy tolerance and await a manual dispute ruling. */
+    EXCLUDED_PENDING_ARBITRATION,
     /** Considered for audit only, not applicable to the feature formula. */
     NOT_APPLICABLE
 }

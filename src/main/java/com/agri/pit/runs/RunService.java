@@ -87,6 +87,21 @@ public class RunService {
                 boundaryVersionId, true, parentRunId, null, "boundary-variant", reason));
     }
 
+    /**
+     * Queue a fresh sampling run for a dispute desk review. It always re-reads the case's intake
+     * frozen geometry (never the newest registry map) at the original cutoff, so a withdrawn ruling
+     * followed by another review produces a brand-new run while every earlier ruling and area result
+     * stays retained on the dispute record.
+     */
+    @Transactional
+    public long queueDisputeResampling(long caseId, Long parentRunId, String reason) {
+        CaseRow row = requireCaseById(caseId);
+        return enqueue(new RunCommand(row.id(), null, "REPLAY", "DISPUTE_RESAMPLING",
+                "AS_OF_CUTOFF", row.scoringCutoff(), row.scoringCutoff(), row.hazardDate(),
+                row.boundaryVersionId(), false, parentRunId, null, "dispute-desk",
+                reason == null ? "dispute desk re-sampling request" : reason));
+    }
+
     private long enqueue(RunCommand cmd) {
         long id = db.insert("""
                         insert into feature_run

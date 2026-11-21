@@ -19,7 +19,7 @@ public class DemoController {
         this.db = db;
     }
 
-    /** Self-describing index of the three sample scenarios and their expected endpoints. */
+    /** Self-describing index of the sample scenarios and their expected endpoints. */
     @GetMapping("/scenarios")
     public Map<String, Object> scenarios() {
         Map<String, Object> body = new LinkedHashMap<>();
@@ -31,7 +31,11 @@ public class DemoController {
                 Map.of("caseNo", DemoSeeder.CASE_SECONDARY,
                         "parcel", "P-1002",
                         "lockedBoundary", "v1",
-                        "note", "control case without overlapping boundaries")));
+                        "note", "control case without overlapping boundaries"),
+                Map.of("caseNo", DemoSeeder.CASE_NEIGHBOUR,
+                        "parcel", "P-1003",
+                        "lockedBoundary", "v1",
+                        "note", "neighbouring farmer whose registry map overlaps P-1001 beyond tolerance")));
         body.put("scenario1LateScene", Map.of(
                 "scene", DemoSeeder.SCENE_LATE,
                 "acquisition", "2024-06-18T09:15:00Z",
@@ -65,8 +69,32 @@ public class DemoController {
                 select (select count(*) from claim_case) as cases,
                        (select count(*) from scoring_snapshot) as snapshots,
                        (select count(*) from review_candidate) as candidates,
-                       (select count(*) from feature_run) as runs
+                       (select count(*) from feature_run) as runs,
+                       (select count(*) from parcel_tenure_version) as tenureVersions,
+                       (select count(*) from case_geometry_freeze) as geometryFreezes,
+                       (select count(*) from boundary_dispute) as disputes
                 """));
+        body.put("scenario4TenureAndFreeze", Map.of(
+                "parcel", "P-1001",
+                "expected", "the intake as-of tenure query resolves to tenure v1/boundary v1; the transfer "
+                        + "tenure v2 is approved after the cutoff and never changes the accepted case; each "
+                        + "case gets an immutable case_geometry_freeze row",
+                "howToCheck", List.of(
+                        "GET /api/tenure/parcels/{parcelId}/versions",
+                        "GET /api/tenure/parcels/{parcelId}/as-of?at=2024-06-22T00:00:00Z",
+                        "GET /api/boundary/cases/" + DemoSeeder.CASE_PRIMARY + "/geometry-freeze")));
+        body.put("scenario5OverlapDispute", Map.of(
+                "parcels", List.of("P-1001", "P-1003"),
+                "expected", "the overlap graph flags the cross-parcel pair as exceedsTolerance; shared "
+                        + "pixels are PENDING_ARBITRATION and attributed to neither claim; the dispute desk "
+                        + "ruling can be withdrawn and a new DISPUTE_RESAMPLING run keeps prior rulings/areas",
+                "howToCheck", List.of(
+                        "POST /api/boundary/parcels/{parcelId}/overlap-analyses",
+                        "GET /api/boundary/parcels/{parcelId}/overlap-graph",
+                        "GET /api/disputes?status=OPEN",
+                        "POST /api/disputes/{id}/rulings",
+                        "POST /api/disputes/{id}/withdrawal",
+                        "POST /api/disputes/{id}/review-requests")));
         return body;
     }
 }

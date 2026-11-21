@@ -43,7 +43,8 @@ public final class InputLedger {
         public boolean hasExclusions() {
             return candidates.stream().anyMatch(c -> switch (c.verdict()) {
                 case EXCLUDED_LATE_AVAILABILITY, EXCLUDED_NOT_YET_INGESTED,
-                     EXCLUDED_NO_SAMPLES_IN_PARCEL, EXCLUDED_PIXEL_ALLOCATED_OTHER_PARCEL -> true;
+                     EXCLUDED_NO_SAMPLES_IN_PARCEL, EXCLUDED_PIXEL_ALLOCATED_OTHER_PARCEL,
+                     EXCLUDED_PENDING_ARBITRATION -> true;
                 default -> false;
             });
         }

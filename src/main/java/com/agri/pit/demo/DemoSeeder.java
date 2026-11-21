@@ -1,10 +1,14 @@
 package com.agri.pit.demo;
 
+import com.agri.pit.boundary.GeometryFreezeService;
+import com.agri.pit.boundary.OverlapAnalysisService;
 import com.agri.pit.catalog.CatalogDtos;
 import com.agri.pit.catalog.CatalogService;
 import com.agri.pit.common.Db;
 import com.agri.pit.ingest.IngestDtos;
 import com.agri.pit.ingest.WarehouseService;
+import com.agri.pit.tenure.TenureDtos;
+import com.agri.pit.tenure.TenureVersionService;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -45,17 +49,26 @@ public class DemoSeeder {
     public static final String WEATHER_REVISION_KEY = "WS-001-W2024-06-13";
     public static final String CASE_PRIMARY = "DROUGHT-2024-0001";
     public static final String CASE_SECONDARY = "DROUGHT-2024-0002";
+    public static final String CASE_NEIGHBOUR = "DROUGHT-2024-0003";
 
     private final Db db;
     private final CatalogService catalog;
     private final WarehouseService warehouse;
+    private final TenureVersionService tenure;
+    private final OverlapAnalysisService overlap;
+    private final GeometryFreezeService freezer;
     private final boolean enabled;
 
     public DemoSeeder(Db db, CatalogService catalog, WarehouseService warehouse,
+                      TenureVersionService tenure, OverlapAnalysisService overlap,
+                      GeometryFreezeService freezer,
                       @Value("${app.demo.seed-on-startup:true}") boolean enabled) {
         this.db = db;
         this.catalog = catalog;
         this.warehouse = warehouse;
+        this.tenure = tenure;
+        this.overlap = overlap;
+        this.freezer = freezer;
         this.enabled = enabled;
     }
 
@@ -66,8 +79,8 @@ public class DemoSeeder {
             return;
         }
         Integer existing = db.jdbc().queryForObject("""
-                        select count(*) from claim_case where case_no in (?, ?)
-                        """, Integer.class, CASE_PRIMARY, CASE_SECONDARY);
+                        select count(*) from claim_case where case_no in (?, ?, ?)
+                        """, Integer.class, CASE_PRIMARY, CASE_SECONDARY, CASE_NEIGHBOUR);
         if (existing != null && existing > 0) {
             log.info("demo data already present, skipping seed");
             return;
@@ -77,10 +90,13 @@ public class DemoSeeder {
         long[] parcels = seedParcelsAndStations();
         long parcel1 = parcels[0];
         long parcel2 = parcels[1];
+        long parcel3 = parcels[2];
         seedScenes();
         seedWeather();
-        seedDeclarations(parcel1, parcel2);
-        seedCases(parcel1, parcel2);
+        seedDeclarations(parcel1, parcel2, parcel3);
+        seedTenure(parcel1, parcel2, parcel3);
+        seedCases(parcel1, parcel2, parcel3);
+        seedOverlapAnalyses(parcel1, parcel3);
         log.info("demo seed complete");
     }
 
@@ -119,6 +135,8 @@ public class DemoSeeder {
                 "North ridge wheat field", "Hebei-North", "WHEAT"));
         long parcel2 = warehouse.createParcel(new IngestDtos.ParcelRequest("P-1002",
                 "South valley wheat field", "Hebei-South", "WHEAT"));
+        long parcel3 = warehouse.createParcel(new IngestDtos.ParcelRequest("P-1003",
+                "East ridge wheat field (neighbouring farmer)", "Hebei-North", "WHEAT"));
 
         // Both boundary versions were available before the case cutoff, so the overlap is a data
         // reality, not a leakage problem. v1 (locked by the case) and v2 (re-survey extending east)
@@ -138,6 +156,14 @@ public class DemoSeeder {
                 LocalDate.of(2024, 1, 1), null,
                 Instant.parse("2024-04-01T08:00:00Z"), Instant.parse("2024-04-02T08:00:00Z"),
                 null, "initial survey"));
+        // Neighbouring farmer's registered map bites roughly one third into P-1001 v1. The overlap
+        // is far beyond the 5% policy tolerance, so shared pixels (e.g. cell A-03) may be attributed
+        // to neither claim until the dispute desk rules.
+        warehouse.addBoundary(parcel3, new IngestDtos.BoundaryRequest(1,
+                polygon(115.9068, 39.900, 115.925, 39.910),
+                LocalDate.of(2024, 1, 1), null,
+                Instant.parse("2024-04-01T08:00:00Z"), Instant.parse("2024-04-02T08:00:00Z"),
+                null, "agri-department registry map; overlaps P-1001 v1 beyond tolerance"));
 
         long station1 = warehouse.createStation(new IngestDtos.StationRequest("WS-001",
                 "North ridge station", 115.905, 39.905));
@@ -146,7 +172,8 @@ public class DemoSeeder {
         warehouse.linkStation(parcel1, station1, 0.7);
         warehouse.linkStation(parcel1, station2, 0.3);
         warehouse.linkStation(parcel2, station2, 1.0);
-        return new long[]{parcel1, parcel2};
+        warehouse.linkStation(parcel3, station2, 1.0);
+        return new long[]{parcel1, parcel2, parcel3};
     }
 
     // ------------------------------------------------------------------- scenes
@@ -165,6 +192,8 @@ public class DemoSeeder {
                         cell("A-05", 115.9065, 39.9060, 0.36),
                         cell("A-08", 115.9130, 39.9050, 0.30),
                         cell("A-09", 115.9140, 39.9060, 0.28),
+                        cell("A-10", 115.9220, 39.9050, 0.33),
+                        cell("A-11", 115.9230, 39.9060, 0.31),
                         cell("A-06", 115.9550, 39.8550, 0.62),
                         cell("A-07", 115.9560, 39.8560, 0.58))));
 
@@ -219,25 +248,94 @@ public class DemoSeeder {
 
     // ------------------------------------------------------------- declarations
 
-    private void seedDeclarations(long parcel1, long parcel2) {
+    private void seedDeclarations(long parcel1, long parcel2, long parcel3) {
         warehouse.ingestDeclaration(new IngestDtos.DeclarationRequest("DECL-2024-1001", parcel1,
                 "WHEAT", LocalDate.of(2024, 3, 15), 5.6, Instant.parse("2024-03-20T08:00:00Z"),
                 Instant.parse("2024-03-22T08:00:00Z"), 1, null, "county-submission"));
         warehouse.ingestDeclaration(new IngestDtos.DeclarationRequest("DECL-2024-1002", parcel2,
                 "WHEAT", LocalDate.of(2024, 3, 18), 4.9, Instant.parse("2024-03-20T08:00:00Z"),
                 Instant.parse("2024-03-22T08:00:00Z"), 1, null, "county-submission"));
+        warehouse.ingestDeclaration(new IngestDtos.DeclarationRequest("DECL-2024-1003", parcel3,
+                "WHEAT", LocalDate.of(2024, 3, 16), 6.2, Instant.parse("2024-03-20T08:00:00Z"),
+                Instant.parse("2024-03-22T08:00:00Z"), 1, null, "county-submission"));
+    }
+
+    // ---------------------------------------------------------------- tenure
+
+    private void seedTenure(long parcel1, long parcel2, long parcel3) {
+        long p1v1 = boundaryId(parcel1, 1);
+        long p1v2 = boundaryId(parcel1, 2);
+        long p2v1 = boundaryId(parcel2, 1);
+        long p3v1 = boundaryId(parcel3, 1);
+
+        // Parcel 1: original operator approved well before the case cutoff. The intake as-of query
+        // therefore resolves to this tenure and its boundary v1.
+        long t1 = tenure.createTenure(new TenureDtos.CreateTenureRequest(parcel1, 1,
+                "Zhang Shoutian", "ID-HEB-1001", "SELF_OPERATED", p1v1, "AGRI_REGISTRY",
+                "REG-2024-0001", LocalDate.of(2024, 1, 1), null,
+                Instant.parse("2024-04-01T08:00:00Z"), Instant.parse("2024-04-02T08:00:00Z"),
+                null, "original registered operator"));
+        tenure.approve(t1, "registry-admin", "approved at spring registration",
+                Instant.parse("2024-04-03T08:00:00Z"));
+
+        // Parcel 1: post-sowing transfer + re-survey. Approved AFTER the case cutoff, so it can only
+        // trigger a follow-up review; the accepted case keeps scoring on tenure v1 / boundary v1.
+        long t2 = tenure.createTenure(new TenureDtos.CreateTenureRequest(parcel1, 2,
+                "Li Suifeng", "ID-HEB-2002", "TRANSFERRED", p1v2, "TRANSFER_DEED",
+                "DEED-2024-0077", LocalDate.of(2024, 6, 1), null,
+                Instant.parse("2024-06-19T08:00:00Z"), Instant.parse("2024-06-21T08:00:00Z"),
+                t1, "land transfer recorded with the re-surveyed boundary"));
+        tenure.approve(t2, "registry-admin", "transfer approved after claim intake",
+                Instant.parse("2024-06-25T08:00:00Z"));
+
+        long t3 = tenure.createTenure(new TenureDtos.CreateTenureRequest(parcel2, 1,
+                "Wang Maixiang", "ID-HEB-1003", "SELF_OPERATED", p2v1, "AGRI_REGISTRY",
+                "REG-2024-0002", LocalDate.of(2024, 1, 1), null,
+                Instant.parse("2024-04-01T08:00:00Z"), Instant.parse("2024-04-02T08:00:00Z"),
+                null, "original registered operator"));
+        tenure.approve(t3, "registry-admin", "approved at spring registration",
+                Instant.parse("2024-04-03T08:00:00Z"));
+
+        long t4 = tenure.createTenure(new TenureDtos.CreateTenureRequest(parcel3, 1,
+                "Zhao Lintian", "ID-HEB-1004", "CONTRACTED", p3v1, "AGRI_REGISTRY",
+                "REG-2024-0003", LocalDate.of(2024, 1, 1), null,
+                Instant.parse("2024-04-01T08:00:00Z"), Instant.parse("2024-04-02T08:00:00Z"),
+                null, "neighbouring farmer; registry map overlaps P-1001"));
+        tenure.approve(t4, "registry-admin", "approved at spring registration",
+                Instant.parse("2024-04-03T08:00:00Z"));
+
+        // A later re-survey that is still pending when the demo starts: it must stay invisible to
+        // every accepted case and to the as-of tenure query.
+        long p1v3 = warehouse.addBoundary(parcel1, new IngestDtos.BoundaryRequest(3,
+                polygon(115.900, 39.900, 115.922, 39.912),
+                LocalDate.of(2024, 7, 1), null,
+                Instant.parse("2024-07-10T08:00:00Z"), Instant.parse("2024-07-11T08:00:00Z"),
+                null, "post-hazard re-survey; pending tenure approval"));
+        tenure.createTenure(new TenureDtos.CreateTenureRequest(parcel1, 3,
+                "Li Suifeng", "ID-HEB-2002", "TRANSFERRED", p1v3, "RE_SURVEY",
+                "SURVEY-2024-0099", LocalDate.of(2024, 7, 1), null,
+                Instant.parse("2024-07-10T08:00:00Z"), Instant.parse("2024-07-11T08:00:00Z"),
+                t2, "pending re-survey after the hazard; not approved, never used by historical cases"));
     }
 
     // -------------------------------------------------------------------- cases
 
-    private void seedCases(long parcel1, long parcel2) {
+    private void seedCases(long parcel1, long parcel2, long parcel3) {
         long parcel1V1 = boundaryId(parcel1, 1);
         long parcel2V1 = boundaryId(parcel2, 1);
+        long parcel3V1 = boundaryId(parcel3, 1);
         insertCase(CASE_PRIMARY, "POL-2024-0001", parcel1, parcel1V1);
         insertCase(CASE_SECONDARY, "POL-2024-0002", parcel2, parcel2V1);
+        insertCase(CASE_NEIGHBOUR, "POL-2024-0003", parcel3, parcel3V1);
         // Reflect that these claims were already settled before the late revision arrived. The
         // queue worker still needs the run snapshot, so settlement is applied by the demo
         // bootstrap once scoring completes (see DemoController bootstrap note / README).
+    }
+
+    private void seedOverlapAnalyses(long parcel1, long parcel3) {
+        // Persist the overlap graph up front so the boundary endpoints have data immediately.
+        overlap.analyzeParcel(parcel1, OverlapAnalysisService.DEFAULT_TOLERANCE_PCT, "BOTH", "demo-seeder");
+        overlap.analyzeParcel(parcel3, OverlapAnalysisService.DEFAULT_TOLERANCE_PCT, "BOTH", "demo-seeder");
     }
 
     private long boundaryId(long parcelId, int versionNo) {
@@ -263,6 +361,9 @@ public class DemoSeeder {
                             values (?, ?)
                             """, caseId, versionId);
         }
+        // Freeze the geometry before any queue worker can score the case.
+        freezer.freezeForCase(new GeometryFreezeService.CaseRef(caseId, caseNo, parcelId,
+                boundaryVersionId, CASE_CUTOFF), null, "demo seed intake freeze");
         db.insert("""
                         insert into feature_run
                             (case_id, mode, trigger_type, status, verdict, data_policy, cutoff_at,

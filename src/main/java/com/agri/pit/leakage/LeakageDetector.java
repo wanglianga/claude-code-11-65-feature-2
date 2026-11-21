@@ -22,7 +22,8 @@ public class LeakageDetector {
             InputVerdict.EXCLUDED_LATE_AVAILABILITY,
             InputVerdict.EXCLUDED_NOT_YET_INGESTED,
             InputVerdict.EXCLUDED_NO_SAMPLES_IN_PARCEL,
-            InputVerdict.EXCLUDED_PIXEL_ALLOCATED_OTHER_PARCEL);
+            InputVerdict.EXCLUDED_PIXEL_ALLOCATED_OTHER_PARCEL,
+            InputVerdict.EXCLUDED_PENDING_ARBITRATION);
 
     private final Db db;
 
